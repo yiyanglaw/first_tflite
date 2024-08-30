@@ -10,8 +10,14 @@ from scipy.ndimage import label as ndi_label
 import psycopg2
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
+import logging
+
 
 app = Flask(__name__)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # Load the TensorFlow Lite model for pill detection
 interpreter = Interpreter(model_path='mobilenet_pill_detection.tflite')
@@ -139,35 +145,57 @@ def update_intake():
     patient_id = data.get('patient_id')
     medicine_time = data.get('medicine_time')
     
+    if not patient_id or not medicine_time:
+        return jsonify({"success": False, "message": "Missing patient_id or medicine_time"}), 400
+    
     conn = get_db_connection()
     cur = conn.cursor()
     current_date = datetime.now().date()
-    cur.execute("""
-        UPDATE medicine_intakes
-        SET taken = TRUE
-        WHERE patient_id = %s AND date = %s AND time = %s
-    """, (patient_id, current_date, medicine_time))
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    return jsonify({"success": True, "message": "Medicine intake recorded."})
+    try:
+        cur.execute("""
+            UPDATE medicine_intakes
+            SET taken = TRUE
+            WHERE patient_id = %s AND date = %s AND time = %s AND taken = FALSE
+            RETURNING id
+        """, (patient_id, current_date, medicine_time))
+        updated_row = cur.fetchone()
+        conn.commit()
+        
+        if updated_row:
+            logging.info(f"Updated intake for patient {patient_id} at {medicine_time}")
+            return jsonify({"success": True, "message": "Medicine intake recorded."})
+        else:
+            logging.warning(f"No matching untaken intake found for patient {patient_id} at {medicine_time}")
+            return jsonify({"success": False, "message": "No matching untaken intake found."}), 404
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Error updating intake: {str(e)}")
+        return jsonify({"success": False, "message": "Database error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 @app.route('/get_pending_times/<int:patient_id>', methods=['GET'])
 def get_pending_times(patient_id):
     conn = get_db_connection()
     cur = conn.cursor()
     current_date = datetime.now().date()
-    cur.execute("""
-        SELECT time
-        FROM medicine_intakes
-        WHERE patient_id = %s AND date = %s AND taken = FALSE
-        ORDER BY time
-    """, (patient_id, current_date))
-    pending_times = [row[0].strftime('%H:%M') for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return jsonify({"pending_times": pending_times})
+    try:
+        cur.execute("""
+            SELECT time
+            FROM medicine_intakes
+            WHERE patient_id = %s AND date = %s AND taken = FALSE
+            ORDER BY time
+        """, (patient_id, current_date))
+        pending_times = [row[0].strftime('%H:%M') for row in cur.fetchall()]
+        logging.info(f"Retrieved pending times for patient {patient_id}: {pending_times}")
+        return jsonify({"pending_times": pending_times})
+    except Exception as e:
+        logging.error(f"Error retrieving pending times: {str(e)}")
+        return jsonify({"error": "Database error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 @app.errorhandler(404)
 def not_found(error):
