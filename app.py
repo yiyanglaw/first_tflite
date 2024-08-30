@@ -1,14 +1,11 @@
-# server.py
-
 import os
-from flask import Flask, request, jsonify
-import numpy as np
-from tflite_runtime.interpreter import Interpreter
 import cv2
-import mediapipe as mp
-from scipy.ndimage import label as ndi_label
+import numpy as np
+from flask import Flask, request, jsonify
+from tflite_runtime.interpreter import Interpreter
 import psycopg2
-from datetime import datetime, timedelta
+from urllib.parse import urlparse
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -20,21 +17,23 @@ interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Initialize MediaPipe for hand detection
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.8)
-
-# Initialize MediaPipe for person segmentation
-mp_selfie_segmentation = mp.solutions.selfie_segmentation
-selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
-
-img_size = (224, 224)
-
 # Database connection setup
 DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
+result = urlparse(DATABASE_URL)
+username = result.username
+password = result.password
+database = result.path[1:]
+hostname = result.hostname
+port = result.port
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(
+        dbname=database,
+        user=username,
+        password=password,
+        host=hostname,
+        port=port
+    )
 
 def preprocess_for_pill_detection(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -50,22 +49,19 @@ def preprocess_for_pill_detection(frame):
     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
     return combined_mask
 
-def detect_pill(frame):
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    seg_results = selfie_segmentation.process(rgb_frame)
-    person_mask = seg_results.segmentation_mask
-    hand_results = hands.process(rgb_frame)
-    hand_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    if hand_results.multi_hand_landmarks:
-        for hand_landmarks in hand_results.multi_hand_landmarks:
-            for landmark in hand_landmarks.landmark:
-                x, y = int(landmark.x * frame.shape[1]), int(landmark.y * frame.shape[0])
-                cv2.circle(hand_mask, (x, y), 20, 255, -1)
-    combined_mask = cv2.bitwise_and(person_mask, person_mask, mask=hand_mask)
-    combined_mask = (combined_mask * 255).astype(np.uint8)
-    roi = cv2.bitwise_and(frame, frame, mask=combined_mask)
-    pill_mask = preprocess_for_pill_detection(roi)
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.get_json()
+    if 'image' not in data or 'patient_id' not in data:
+        return jsonify({"error": "Invalid request data"}), 400
+
+    image_data = np.frombuffer(data['image'].encode('latin1'), dtype=np.uint8)
+    frame = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+    img_size = (224, 224)
+
+    pill_mask = preprocess_for_pill_detection(frame)
     labeled_mask, num_labels = ndi_label(pill_mask)
+
     pill_detected = False
     for label_id in range(1, num_labels + 1):
         label_mask = (labeled_mask == label_id).astype(np.uint8) * 255
@@ -79,89 +75,29 @@ def detect_pill(frame):
                 img = cv2.resize(roi, img_size)
                 img = img / 255.0
                 img = np.expand_dims(img, axis=0).astype(np.float32)
-                
+
                 # Perform detection using TensorFlow Lite model
                 interpreter.set_tensor(input_details[0]['index'], img)
                 interpreter.invoke()
                 prediction = interpreter.get_tensor(output_details[0]['index'])
-                
-                if prediction[0] > 0.9:
-                    pill_detected = True
-                    break
-    return pill_detected
 
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    patient_name = data.get('name')
-    patient_ic = data.get('ic')
-    if patient_name and patient_ic:
+                label_text = 'Pill' if prediction[0] > 0.9 else 'No Pill'
+                pill_detected = label_text == 'Pill'
+    
+    if pill_detected:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, medicine_times FROM patients WHERE name = %s AND ic = %s", (patient_name, patient_ic))
-        result = cur.fetchone()
+        current_date = datetime.now().date()
+        cur.execute("""
+            UPDATE medicine_intakes
+            SET taken = TRUE
+            WHERE patient_id = %s AND date = %s AND time = %s
+        """, (data['patient_id'], current_date, data['medicine_time']))
+        conn.commit()
         cur.close()
         conn.close()
-        if result:
-            patient_id, medicine_times = result
-            return jsonify({"success": True, "patient_id": patient_id, "medicine_times": medicine_times})
-        else:
-            return jsonify({"success": False, "message": "Invalid patient name or IC."})
-    else:
-        return jsonify({"success": False, "message": "Please provide both name and IC."})
 
-@app.route('/detect_pill', methods=['POST'])
-def process_image():
-    # Receive image data from client
-    image_data = request.files['image'].read()
-    nparr = np.frombuffer(image_data, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
-    # Perform pill detection
-    pill_detected = detect_pill(frame)
-    
     return jsonify({"pill_detected": pill_detected})
 
-@app.route('/update_intake', methods=['POST'])
-def update_intake():
-    data = request.json
-    patient_id = data.get('patient_id')
-    medicine_time = data.get('medicine_time')
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    current_date = datetime.now().date()
-    cur.execute("""
-        UPDATE medicine_intakes
-        SET taken = TRUE
-        WHERE patient_id = %s AND date = %s AND time = %s
-    """, (patient_id, current_date, medicine_time))
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    return jsonify({"success": True, "message": "Medicine intake recorded."})
-
-@app.route('/get_pending_times', methods=['POST'])
-def get_pending_times():
-    data = request.json
-    patient_id = data.get('patient_id')
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    current_date = datetime.now().date()
-    cur.execute("""
-        SELECT time
-        FROM medicine_intakes
-        WHERE patient_id = %s AND date = %s AND taken = FALSE
-        ORDER BY time
-    """, (patient_id, current_date))
-    pending_times = [row[0].strftime('%H:%M') for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    
-    return jsonify({"pending_times": pending_times})
-
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=7777)
-
+    app.run(host='0.0.0.0', port=5000)
