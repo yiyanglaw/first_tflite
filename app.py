@@ -1,12 +1,18 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+
 from flask import Flask, request, jsonify
+import cv2
 import numpy as np
 from tflite_runtime.interpreter import Interpreter
-import cv2
 import mediapipe as mp
 from scipy.ndimage import label as ndi_label
 import psycopg2
+from urllib.parse import urlparse
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -29,10 +35,22 @@ selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=
 img_size = (224, 224)
 
 # Database connection setup
-DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
+DATABASE_URL = os.getenv("DATABASE_URL")
+result = urlparse(DATABASE_URL)
+username = result.username
+password = result.password
+database = result.path[1:]
+hostname = result.hostname
+port = result.port
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(
+        dbname=database,
+        user=username,
+        password=password,
+        host=hostname,
+        port=port
+    )
 
 def preprocess_for_pill_detection(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -77,12 +95,9 @@ def detect_pill(frame):
                 img = cv2.resize(roi, img_size)
                 img = img / 255.0
                 img = np.expand_dims(img, axis=0).astype(np.float32)
-                
-                # Perform detection using TensorFlow Lite model
                 interpreter.set_tensor(input_details[0]['index'], img)
                 interpreter.invoke()
                 prediction = interpreter.get_tensor(output_details[0]['index'])
-                
                 if prediction[0] > 0.9:
                     pill_detected = True
                     break
@@ -96,13 +111,19 @@ def login():
     if patient_name and patient_ic:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, medicine_times FROM patients WHERE name = %s AND ic = %s", (patient_name, patient_ic))
+        cur.execute("SELECT id, image FROM patients WHERE name = %s AND ic = %s", (patient_name, patient_ic))
         result = cur.fetchone()
         cur.close()
         conn.close()
         if result:
-            patient_id, medicine_times = result
-            return jsonify({"success": True, "patient_id": patient_id, "medicine_times": medicine_times})
+            patient_id, patient_image = result
+            if patient_image:
+                nparr = np.frombuffer(patient_image, np.uint8)
+                known_face_image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                known_face_features = cv2.resize(known_face_image, (100, 100)).flatten().tolist()
+                return jsonify({"success": True, "patient_id": patient_id, "known_face_features": known_face_features})
+            else:
+                return jsonify({"success": False, "message": "No image found for this patient."})
         else:
             return jsonify({"success": False, "message": "Invalid patient name or IC."})
     else:
@@ -110,14 +131,10 @@ def login():
 
 @app.route('/detect_pill', methods=['POST'])
 def process_image():
-    # Receive image data from client
-    image_data = request.files['image'].read()
-    nparr = np.frombuffer(image_data, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
-    # Perform pill detection
+    file = request.files['image']
+    npimg = np.fromfile(file, np.uint8)
+    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
     pill_detected = detect_pill(frame)
-    
     return jsonify({"pill_detected": pill_detected})
 
 @app.route('/update_intake', methods=['POST'])
@@ -140,31 +157,20 @@ def update_intake():
     
     return jsonify({"success": True, "message": "Medicine intake recorded."})
 
-@app.route('/get_pending_times', methods=['POST'])
-def get_pending_times():
-    data = request.json
-    patient_id = data.get('patient_id')
-    
+@app.route('/get_pending_times/<int:patient_id>', methods=['GET'])
+def get_pending_times(patient_id):
     conn = get_db_connection()
     cur = conn.cursor()
     current_date = datetime.now().date()
-    current_time = datetime.now().time()
-    
-    # Fetch medicine times that are within the last 5 minutes or in the future
-    five_minutes_ago = (datetime.combine(current_date, current_time) - timedelta(minutes=5)).time()
-    
     cur.execute("""
         SELECT time
         FROM medicine_intakes
-        WHERE patient_id = %s AND date = %s AND taken = FALSE AND time >= %s
+        WHERE patient_id = %s AND date = %s AND taken = FALSE
         ORDER BY time
-    """, (patient_id, current_date, five_minutes_ago))
-    
+    """, (patient_id, current_date))
     pending_times = [row[0].strftime('%H:%M') for row in cur.fetchall()]
     cur.close()
     conn.close()
-    
     return jsonify({"pending_times": pending_times})
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=7777)
+if __name__ == '__
