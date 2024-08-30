@@ -153,12 +153,15 @@ def update_intake():
     cur = conn.cursor()
     current_date = datetime.now().date()
     try:
+        # Convert medicine_time to Time object
+        medicine_time_obj = datetime.strptime(medicine_time, '%H:%M').time()
+        
         cur.execute("""
             UPDATE medicine_intakes
             SET taken = TRUE, taken_time = %s
             WHERE patient_id = %s AND date = %s AND time = %s AND taken = FALSE
             RETURNING id
-        """, (taken_time, patient_id, current_date, medicine_time))
+        """, (taken_time, patient_id, current_date, medicine_time_obj))
         updated_row = cur.fetchone()
         conn.commit()
         
@@ -171,7 +174,7 @@ def update_intake():
     except Exception as e:
         conn.rollback()
         logging.error(f"Error updating intake: {str(e)}")
-        return jsonify({"success": False, "message": "Database error occurred."}), 500
+        return jsonify({"success": False, "message": f"Database error occurred: {str(e)}"}), 500
     finally:
         cur.close()
         conn.close()
@@ -193,11 +196,11 @@ def get_pending_times(patient_id):
         return jsonify({"pending_times": pending_times})
     except Exception as e:
         logging.error(f"Error retrieving pending times: {str(e)}")
-        return jsonify({"error": "Database error occurred."}), 500
+        return jsonify({"error": f"Database error occurred: {str(e)}"}), 500
     finally:
         cur.close()
         conn.close()
-
+        
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Not found"}), 404
