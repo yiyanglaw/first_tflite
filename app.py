@@ -9,10 +9,10 @@ import mediapipe as mp
 from scipy.ndimage import label as ndi_label
 import psycopg2
 from urllib.parse import urlparse
-from dotenv import load_dotenv
+
 from datetime import datetime, timedelta
 
-load_dotenv()
+
 
 app = Flask(__name__)
 
