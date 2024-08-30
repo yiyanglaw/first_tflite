@@ -1,5 +1,3 @@
-# server.py
-
 import os
 from flask import Flask, request, jsonify
 import numpy as np
@@ -150,12 +148,18 @@ def get_pending_times():
     conn = get_db_connection()
     cur = conn.cursor()
     current_date = datetime.now().date()
+    current_time = datetime.now().time()
+    
+    # Fetch medicine times that are within the last 5 minutes or in the future
+    five_minutes_ago = (datetime.combine(current_date, current_time) - timedelta(minutes=5)).time()
+    
     cur.execute("""
         SELECT time
         FROM medicine_intakes
-        WHERE patient_id = %s AND date = %s AND taken = FALSE
+        WHERE patient_id = %s AND date = %s AND taken = FALSE AND time >= %s
         ORDER BY time
-    """, (patient_id, current_date))
+    """, (patient_id, current_date, five_minutes_ago))
+    
     pending_times = [row[0].strftime('%H:%M') for row in cur.fetchall()]
     cur.close()
     conn.close()
