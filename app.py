@@ -9,10 +9,7 @@ import mediapipe as mp
 from scipy.ndimage import label as ndi_label
 import psycopg2
 from urllib.parse import urlparse
-
 from datetime import datetime, timedelta
-
-
 
 app = Flask(__name__)
 
@@ -171,6 +168,14 @@ def get_pending_times(patient_id):
     cur.close()
     conn.close()
     return jsonify({"pending_times": pending_times})
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=7777)
