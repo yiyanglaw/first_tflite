@@ -34,8 +34,7 @@ selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=
 
 img_size = (224, 224)
 
-# Database connection setup
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
 result = urlparse(DATABASE_URL)
 username = result.username
 password = result.password
