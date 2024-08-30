@@ -163,4 +163,4 @@ def get_pending_times():
     return jsonify({"pending_times": pending_times})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True,port=7777)
