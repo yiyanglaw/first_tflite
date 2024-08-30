@@ -172,4 +172,5 @@ def get_pending_times(patient_id):
     conn.close()
     return jsonify({"pending_times": pending_times})
 
-if __name__ == '__
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=7777)
