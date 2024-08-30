@@ -1,11 +1,11 @@
 import os
 import cv2
 import numpy as np
-from flask import Flask, request, jsonify
 from tflite_runtime.interpreter import Interpreter
-import psycopg2
-from urllib.parse import urlparse
-from datetime import datetime
+import mediapipe as mp
+from scipy.ndimage import label as ndi_label
+import face_recognition
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -17,23 +17,15 @@ interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Database connection setup
-DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
-result = urlparse(DATABASE_URL)
-username = result.username
-password = result.password
-database = result.path[1:]
-hostname = result.hostname
-port = result.port
+# Initialize MediaPipe for hand detection
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.8)
 
-def get_db_connection():
-    return psycopg2.connect(
-        dbname=database,
-        user=username,
-        password=password,
-        host=hostname,
-        port=port
-    )
+# Initialize MediaPipe for person segmentation
+mp_selfie_segmentation = mp.solutions.selfie_segmentation
+selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
+
+img_size = (224, 224)
 
 def preprocess_for_pill_detection(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -49,19 +41,22 @@ def preprocess_for_pill_detection(frame):
     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
     return combined_mask
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    data = request.get_json()
-    if 'image' not in data or 'patient_id' not in data:
-        return jsonify({"error": "Invalid request data"}), 400
-
-    image_data = np.frombuffer(data['image'].encode('latin1'), dtype=np.uint8)
-    frame = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-    img_size = (224, 224)
-
-    pill_mask = preprocess_for_pill_detection(frame)
+def detect_pill(frame):
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    seg_results = selfie_segmentation.process(rgb_frame)
+    person_mask = seg_results.segmentation_mask
+    hand_results = hands.process(rgb_frame)
+    hand_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    if hand_results.multi_hand_landmarks:
+        for hand_landmarks in hand_results.multi_hand_landmarks:
+            for landmark in hand_landmarks.landmark:
+                x, y = int(landmark.x * frame.shape[1]), int(landmark.y * frame.shape[0])
+                cv2.circle(hand_mask, (x, y), 20, 255, -1)
+    combined_mask = cv2.bitwise_and(person_mask, person_mask, mask=hand_mask)
+    combined_mask = (combined_mask * 255).astype(np.uint8)
+    roi = cv2.bitwise_and(frame, frame, mask=combined_mask)
+    pill_mask = preprocess_for_pill_detection(roi)
     labeled_mask, num_labels = ndi_label(pill_mask)
-
     pill_detected = False
     for label_id in range(1, num_labels + 1):
         label_mask = (labeled_mask == label_id).astype(np.uint8) * 255
@@ -75,29 +70,32 @@ def predict():
                 img = cv2.resize(roi, img_size)
                 img = img / 255.0
                 img = np.expand_dims(img, axis=0).astype(np.float32)
-
+                
                 # Perform detection using TensorFlow Lite model
                 interpreter.set_tensor(input_details[0]['index'], img)
                 interpreter.invoke()
                 prediction = interpreter.get_tensor(output_details[0]['index'])
+                
+                pill_detected = prediction[0] > 0.9
+    return pill_detected
 
-                label_text = 'Pill' if prediction[0] > 0.9 else 'No Pill'
-                pill_detected = label_text == 'Pill'
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.json
+    frame = np.array(data['frame'], dtype=np.uint8)
+    frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
     
-    if pill_detected:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        current_date = datetime.now().date()
-        cur.execute("""
-            UPDATE medicine_intakes
-            SET taken = TRUE
-            WHERE patient_id = %s AND date = %s AND time = %s
-        """, (data['patient_id'], current_date, data['medicine_time']))
-        conn.commit()
-        cur.close()
-        conn.close()
+    known_face_encoding = np.array(data['known_face_encoding'])
+    face_encodings = face_recognition.face_encodings(frame)
+    
+    same_person_detected = any(face_recognition.compare_faces([known_face_encoding], encoding, tolerance=0.5) for encoding in face_encodings)
+    
+    if same_person_detected:
+        pill_detected = detect_pill(frame)
+        if pill_detected:
+            return jsonify({"result": "Pill detected"})
+        return jsonify({"result": "Pill not detected"})
+    return jsonify({"result": "Face not recognized"})
 
-    return jsonify({"pill_detected": pill_detected})
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
