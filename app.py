@@ -1,11 +1,20 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+
 import cv2
 import numpy as np
 from tflite_runtime.interpreter import Interpreter
 import mediapipe as mp
 from scipy.ndimage import label as ndi_label
 import face_recognition
+import psycopg2
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import time
 from flask import Flask, request, jsonify
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -26,6 +35,24 @@ mp_selfie_segmentation = mp.solutions.selfie_segmentation
 selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
 
 img_size = (224, 224)
+
+# Database connection setup
+DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
+result = urlparse(DATABASE_URL)
+username = result.username
+password = result.password
+database = result.path[1:]
+hostname = result.hostname
+port = result.port
+
+def get_db_connection():
+    return psycopg2.connect(
+        dbname=database,
+        user=username,
+        password=password,
+        host=hostname,
+        port=port
+    )
 
 def preprocess_for_pill_detection(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -76,26 +103,103 @@ def detect_pill(frame):
                 interpreter.invoke()
                 prediction = interpreter.get_tensor(output_details[0]['index'])
                 
-                pill_detected = prediction[0] > 0.9
+                if prediction[0] > 0.9:
+                    pill_detected = True
+                    break
     return pill_detected
 
-@app.route('/predict', methods=['POST'])
-def predict():
+def update_medicine_intake(patient_id, medicine_time):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    current_date = datetime.now().date()
+    cur.execute("""
+        UPDATE medicine_intakes
+        SET taken = TRUE
+        WHERE patient_id = %s AND date = %s AND time = %s
+    """, (patient_id, current_date, medicine_time))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_pending_medicine_times(patient_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    current_date = datetime.now().date()
+    cur.execute("""
+        SELECT time
+        FROM medicine_intakes
+        WHERE patient_id = %s AND date = %s AND taken = FALSE
+        ORDER BY time
+    """, (patient_id, current_date))
+    pending_times = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return pending_times
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    patient_name = data.get('name')
+    patient_ic = data.get('ic')
+    if patient_name and patient_ic:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, image, medicine_times FROM patients WHERE name = %s AND ic = %s", (patient_name, patient_ic))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        if result:
+            patient_id, patient_image, medicine_times = result
+            if patient_image:
+                nparr = np.frombuffer(patient_image, np.uint8)
+                known_face_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                known_face_image = cv2.cvtColor(known_face_image, cv2.COLOR_BGR2RGB)
+                known_face_encoding = face_recognition.face_encodings(known_face_image)[0]
+                return jsonify({"success": True, "patient_id": patient_id, "known_face_encoding": known_face_encoding.tolist(), "medicine_times": medicine_times})
+            else:
+                return jsonify({"success": False, "error": "No image found for this patient."})
+        else:
+            return jsonify({"success": False, "error": "Invalid patient name or IC."})
+    else:
+        return jsonify({"success": False, "error": "Please provide both name and IC."})
+
+@app.route('/process_frame', methods=['POST'])
+def process_frame():
     data = request.json
     frame = np.array(data['frame'], dtype=np.uint8)
-    frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
-    
     known_face_encoding = np.array(data['known_face_encoding'])
-    face_encodings = face_recognition.face_encodings(frame)
-    
-    same_person_detected = any(face_recognition.compare_faces([known_face_encoding], encoding, tolerance=0.5) for encoding in face_encodings)
-    
+    patient_id = data['patient_id']
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_frame)
+    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+    same_person_detected = False
+    for face_encoding in face_encodings:
+        results = face_recognition.compare_faces([known_face_encoding], face_encoding, tolerance=0.5)
+        if results[0]:
+            same_person_detected = True
+            break
+
+    pill_detected = False
     if same_person_detected:
         pill_detected = detect_pill(frame)
-        if pill_detected:
-            return jsonify({"result": "Pill detected"})
-        return jsonify({"result": "Pill not detected"})
-    return jsonify({"result": "Face not recognized"})
+
+    pending_times = get_pending_medicine_times(patient_id)
+    
+    return jsonify({
+        "same_person_detected": same_person_detected,
+        "pill_detected": pill_detected,
+        "pending_times": [time.strftime('%H:%M') for time in pending_times]
+    })
+
+@app.route('/update_intake', methods=['POST'])
+def update_intake():
+    data = request.json
+    patient_id = data['patient_id']
+    medicine_time = data['medicine_time']
+    update_medicine_intake(patient_id, medicine_time)
+    return jsonify({"success": True})
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
