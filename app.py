@@ -84,7 +84,7 @@ def detect_pill(frame):
         if contours:
             largest_contour = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(largest_contour)
-            if 100 < area < 10000:
+            if 1 < area < 10000:
                 x, y, w, h = cv2.boundingRect(largest_contour)
                 roi = frame[y:y+h, x:x+w]
                 img = cv2.resize(roi, img_size)
