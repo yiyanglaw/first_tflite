@@ -137,29 +137,27 @@ def update_intake():
     data = request.json
     patient_id = data.get('patient_id')
     medicine_time = data.get('medicine_time')
-    taken_time = data.get('taken_time')
     
-    if not patient_id or not medicine_time or not taken_time:
-        return jsonify({"success": False, "message": "Missing patient_id, medicine_time, or taken_time"}), 400
+    if not patient_id or not medicine_time:
+        return jsonify({"success": False, "message": "Missing patient_id or medicine_time"}), 400
     
     conn = get_db_connection()
     cur = conn.cursor()
     current_date = datetime.now().date()
     try:
         medicine_time_obj = datetime.strptime(medicine_time, '%I:%M %p').time()
-        taken_time_obj = datetime.strptime(taken_time, '%I:%M %p').time()
         
         cur.execute("""
             UPDATE medicine_intakes
-            SET taken = TRUE, taken_time = %s
+            SET taken = TRUE
             WHERE patient_id = %s AND date = %s AND time = %s AND taken = FALSE
             RETURNING id
-        """, (taken_time_obj, patient_id, current_date, medicine_time_obj))
+        """, (patient_id, current_date, medicine_time_obj))
         updated_row = cur.fetchone()
         conn.commit()
         
         if updated_row:
-            logging.info(f"Updated intake for patient {patient_id} at {medicine_time}, taken at {taken_time}")
+            logging.info(f"Updated intake for patient {patient_id} at {medicine_time}")
             return jsonify({"success": True, "message": "Medicine intake recorded."})
         else:
             logging.warning(f"No matching untaken intake found for patient {patient_id} at {medicine_time}")
@@ -171,7 +169,6 @@ def update_intake():
     finally:
         cur.close()
         conn.close()
-
 @app.route('/get_pending_times/<int:patient_id>', methods=['GET'])
 def get_pending_times(patient_id):
     conn = get_db_connection()
