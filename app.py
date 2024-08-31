@@ -1,5 +1,5 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 from flask import Flask, request, jsonify
 import cv2
@@ -12,26 +12,19 @@ from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import logging
 
-
 app = Flask(__name__)
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-# Load the TensorFlow Lite model for pill detection
 interpreter = Interpreter(model_path='mobilenet_pill_detection.tflite')
 interpreter.allocate_tensors()
 
-# Get input and output tensor details
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-# Initialize MediaPipe for hand detection
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.8)
 
-# Initialize MediaPipe for person segmentation
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
 
@@ -153,15 +146,15 @@ def update_intake():
     cur = conn.cursor()
     current_date = datetime.now().date()
     try:
-        # Convert medicine_time to Time object
-        medicine_time_obj = datetime.strptime(medicine_time, '%H:%M').time()
+        medicine_time_obj = datetime.strptime(medicine_time, '%I:%M %p').time()
+        taken_time_obj = datetime.strptime(taken_time, '%I:%M %p').time()
         
         cur.execute("""
             UPDATE medicine_intakes
             SET taken = TRUE, taken_time = %s
             WHERE patient_id = %s AND date = %s AND time = %s AND taken = FALSE
             RETURNING id
-        """, (taken_time, patient_id, current_date, medicine_time_obj))
+        """, (taken_time_obj, patient_id, current_date, medicine_time_obj))
         updated_row = cur.fetchone()
         conn.commit()
         
@@ -191,7 +184,7 @@ def get_pending_times(patient_id):
             WHERE patient_id = %s AND date = %s AND taken = FALSE
             ORDER BY time
         """, (patient_id, current_date))
-        pending_times = [row[0].strftime('%H:%M') for row in cur.fetchall()]
+        pending_times = [row[0].strftime('%I:%M %p') for row in cur.fetchall()]
         logging.info(f"Retrieved pending times for patient {patient_id}: {pending_times}")
         return jsonify({"pending_times": pending_times})
     except Exception as e:
@@ -200,7 +193,47 @@ def get_pending_times(patient_id):
     finally:
         cur.close()
         conn.close()
+
+@app.route('/check_new_day/<int:patient_id>', methods=['GET'])
+def check_new_day(patient_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    current_date = datetime.now().date()
+    try:
+        cur.execute("""
+            SELECT COUNT(*) FROM medicine_intakes
+            WHERE patient_id = %s AND date = %s
+        """, (patient_id, current_date))
+        count = cur.fetchone()[0]
         
+        if count == 0:
+            cur.execute("""
+                INSERT INTO medicine_intakes (patient_id, date, time, taken)
+                SELECT %s, %s, unnest(medicine_times), FALSE
+                FROM patients
+                WHERE id = %s
+            """, (patient_id, current_date, patient_id))
+            conn.commit()
+            
+            cur.execute("""
+                SELECT time
+                FROM medicine_intakes
+                WHERE patient_id = %s AND date = %s AND taken = FALSE
+                ORDER BY time
+            """, (patient_id, current_date))
+            new_pending_times = [row[0].strftime('%I:%M %p') for row in cur.fetchall()]
+            
+            return jsonify({"new_day": True, "pending_times": new_pending_times})
+        else:
+            return jsonify({"new_day": False})
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Error checking new day: {str(e)}")
+        return jsonify({"error": f"Database error occurred: {str(e)}"}), 500
+    finally:
+        cur.close()
+        conn.close()
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Not found"}), 404
