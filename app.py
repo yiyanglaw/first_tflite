@@ -1,5 +1,5 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
 
 from flask import Flask, request, jsonify
 import cv2
@@ -221,9 +221,9 @@ def check_new_day(patient_id):
                 WHERE patient_id = %s AND date = %s AND taken = FALSE
                 ORDER BY time
             """, (patient_id, current_date))
-            new_pending_times = [row[0].strftime('%I:%M %p') for row in cur.fetchall()]
+            pending_times = [row[0].strftime('%I:%M %p') for row in cur.fetchall()]
             
-            return jsonify({"new_day": True, "pending_times": new_pending_times})
+            return jsonify({"new_day": True, "pending_times": pending_times})
         else:
             return jsonify({"new_day": False})
     except Exception as e:
