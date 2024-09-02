@@ -11,6 +11,8 @@ import psycopg2
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import logging
+from inference_sdk import InferenceHTTPClient
+import requests
 
 app = Flask(__name__)
 
@@ -22,13 +24,20 @@ interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
+mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.8)
+mp_drawing = mp.solutions.drawing_utils
 
-mp_selfie_segmentation = mp.solutions.selfie_segmentation
-selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
+# Initialize the inference client for pill detection
+PILL_CLIENT = InferenceHTTPClient(
+    api_url="https://detect.roboflow.com",
+    api_key="lJ0tgYHt58Kl2kCeMlQb"
+)
 
-img_size = (224, 224)
+# Initialize YOLO for bottle detection
+YOLO_WEIGHTS_URL = "https://firebasestorage.googleapis.com/v0/b/pdata1.appspot.com/o/yolov3.weights?alt=media&token=4fd140ae-0f00-4de4-9fa7-dc10f75e70c3"
+YOLO_CONFIG_PATH = "yolov3.cfg"
+COCO_NAMES_PATH = "coco.names"
 
 DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
 result = urlparse(DATABASE_URL)
@@ -61,42 +70,118 @@ def preprocess_for_pill_detection(frame):
     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
     return combined_mask
 
-def detect_pill(frame):
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    seg_results = selfie_segmentation.process(rgb_frame)
-    person_mask = seg_results.segmentation_mask
-    hand_results = hands.process(rgb_frame)
-    hand_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    if hand_results.multi_hand_landmarks:
-        for hand_landmarks in hand_results.multi_hand_landmarks:
-            for landmark in hand_landmarks.landmark:
-                x, y = int(landmark.x * frame.shape[1]), int(landmark.y * frame.shape[0])
-                cv2.circle(hand_mask, (x, y), 20, 255, -1)
-    combined_mask = cv2.bitwise_and(person_mask, person_mask, mask=hand_mask)
-    combined_mask = (combined_mask * 255).astype(np.uint8)
-    roi = cv2.bitwise_and(frame, frame, mask=combined_mask)
-    pill_mask = preprocess_for_pill_detection(roi)
-    labeled_mask, num_labels = ndi_label(pill_mask)
-    pill_detected = False
-    for label_id in range(1, num_labels + 1):
-        label_mask = (labeled_mask == label_id).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(label_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            if 1 < area < 10000:
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                roi = frame[y:y+h, x:x+w]
-                img = cv2.resize(roi, img_size)
-                img = img / 255.0
-                img = np.expand_dims(img, axis=0).astype(np.float32)
-                interpreter.set_tensor(input_details[0]['index'], img)
-                interpreter.invoke()
-                prediction = interpreter.get_tensor(output_details[0]['index'])
-                if prediction[0] > 0.6:
+def detect_pills(frame):
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose, \
+         mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image.flags.writeable = False
+        pose_results = pose.process(image)
+        hand_results = hands.process(image)
+        image.flags.writeable = True
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        # Detect pills using the Roboflow model
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+            temp_filename = temp_file.name
+            cv2.imwrite(temp_filename, frame)
+            result = PILL_CLIENT.infer(temp_filename, model_id="pill-detection-llp4r/3")
+        os.remove(temp_filename)
+
+        pill_detected = False
+        if 'predictions' in result:
+            predictions = result['predictions']
+            for pred in predictions:
+                if pred['confidence'] > 0.6:
                     pill_detected = True
                     break
-    return pill_detected
+
+        # Check for hand near mouth
+        hand_near_mouth = check_hand_near_mouth(pose_results.pose_landmarks, hand_results.multi_hand_landmarks)
+
+        # Detect bottles
+        bottle_boxes = detect_bottles(frame)
+        bottle_detected = len(bottle_boxes) > 0
+
+        return pill_detected, hand_near_mouth, bottle_detected
+
+def check_hand_near_mouth(pose_landmarks, hand_landmarks):
+    HAND_NEAR_MOUTH_THRESHOLD = 1.3
+
+    if pose_landmarks and hand_landmarks:
+        mouth_left = pose_landmarks.landmark[mp_pose.PoseLandmark.MOUTH_LEFT]
+        mouth_right = pose_landmarks.landmark[mp_pose.PoseLandmark.MOUTH_RIGHT]
+
+        for hand_landmark in hand_landmarks:
+            index_tip = hand_landmark.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            thumb_tip = hand_landmark.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            index_distance_left = calculate_distance(index_tip, mouth_left)
+            index_distance_right = calculate_distance(index_tip, mouth_right)
+            thumb_distance_left = calculate_distance(thumb_tip, mouth_left)
+            thumb_distance_right = calculate_distance(thumb_tip, mouth_right)
+
+            if (1.0 < index_distance_left < HAND_NEAR_MOUTH_THRESHOLD or
+                1.0 < index_distance_right < HAND_NEAR_MOUTH_THRESHOLD or
+                1.0 < thumb_distance_left < HAND_NEAR_MOUTH_THRESHOLD or
+                1.0 < thumb_distance_right < HAND_NEAR_MOUTH_THRESHOLD):
+                return True
+    return False
+
+def calculate_distance(point1, point2):
+    return np.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2 + (point1.z - point2.z)**2)
+
+def detect_bottles(frame):
+    net, classes, output_layers = load_yolo()
+    height, width, _ = frame.shape
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+    net.setInput(blob)
+    layer_outputs = net.forward(output_layers)
+
+    boxes = []
+    confidences = []
+    class_ids = []
+
+    for output in layer_outputs:
+        for detection in output:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > 0.4 and classes[class_id] == 'bottle':
+                center_x, center_y, w, h = (detection[0:4] * np.array([width, height, width, height])).astype('int')
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                boxes.append([x, y, int(w), int(h)])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+
+    detected_bottles = []
+    if len(indices) > 0:
+        indices = indices.flatten()
+        for i in indices:
+            detected_bottles.append({
+                'box': boxes[i],
+                'confidence': confidences[i],
+                'class': classes[class_ids[i]]
+            })
+    return detected_bottles
+
+def load_yolo():
+    # Download the weights file
+    response = requests.get(YOLO_WEIGHTS_URL)
+    with open("yolov3.weights", "wb") as f:
+        f.write(response.content)
+
+    net = cv2.dnn.readNet("yolov3.weights", YOLO_CONFIG_PATH)
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+    classes = []
+    with open(COCO_NAMES_PATH, "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+    layers_names = net.getLayerNames()
+    output_layers = [layers_names[i - 1] for i in net.getUnconnectedOutLayers()]
+    return net, classes, output_layers
+
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -129,8 +214,11 @@ def process_image():
     file = request.files['image']
     npimg = np.fromfile(file, np.uint8)
     frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-    pill_detected = detect_pill(frame)
-    return jsonify({"pill_detected": pill_detected})
+
+    # Detect pills, hand near mouth, and bottles
+    pill_detected, hand_near_mouth, bottle_detected = detect_pills(frame)
+
+    return jsonify({"pill_detected": pill_detected, "hand_near_mouth": hand_near_mouth, "bottle_detected": bottle_detected})
 
 @app.route('/update_intake', methods=['POST'])
 def update_intake():
@@ -230,7 +318,7 @@ def check_new_day(patient_id):
     finally:
         cur.close()
         conn.close()
-
+        
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Not found"}), 404
