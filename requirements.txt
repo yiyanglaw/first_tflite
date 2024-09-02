@@ -5,3 +5,4 @@ opencv-python-headless>=4.8.0.76
 mediapipe>=0.10.4
 scipy>=1.11.3
 psycopg2>=2.9.7
+inference_sdk
