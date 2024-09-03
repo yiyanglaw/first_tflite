@@ -84,7 +84,11 @@ def detect_pills(frame):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
             temp_filename = temp_file.name
             cv2.imwrite(temp_filename, frame)
-            result = PILL_CLIENT.infer(temp_filename, model_id="pill-detection-llp4r/3")
+            try:
+                result = PILL_CLIENT.infer(temp_filename, model_id="pill-detection-llp4r/3")
+            except Exception as e:
+                logging.error(f"Error in pill detection: {str(e)}")
+                result = {"predictions": []}
         os.remove(temp_filename)
 
         pill_detected = False
@@ -103,6 +107,7 @@ def detect_pills(frame):
         bottle_detected = len(bottle_boxes) > 0
 
         return pill_detected, hand_near_mouth, bottle_detected
+
 
 def check_hand_near_mouth(pose_landmarks, hand_landmarks):
     HAND_NEAR_MOUTH_THRESHOLD = 1.3
