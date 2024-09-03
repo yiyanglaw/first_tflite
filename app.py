@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import logging
 from inference_sdk import InferenceHTTPClient
 import requests
+import tempfile
 
 app = Flask(__name__)
 
@@ -107,7 +108,6 @@ def detect_pills(frame):
         bottle_detected = len(bottle_boxes) > 0
 
         return pill_detected, hand_near_mouth, bottle_detected
-
 
 def check_hand_near_mouth(pose_landmarks, hand_landmarks):
     HAND_NEAR_MOUTH_THRESHOLD = 1.3
