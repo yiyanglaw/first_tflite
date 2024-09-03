@@ -11,24 +11,34 @@ import psycopg2
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import logging
+from inference_sdk import InferenceHTTPClient
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Initialize TFLite interpreter
 interpreter = Interpreter(model_path='mobilenet_pill_detection.tflite')
 interpreter.allocate_tensors()
-
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
+# Initialize Mediapipe
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.8)
-
 mp_selfie_segmentation = mp.solutions.selfie_segmentation
 selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+# Initialize InferenceHTTPClient for pill detection
+PILL_CLIENT = InferenceHTTPClient(
+    api_url="https://detect.roboflow.com",
+    api_key="lJ0tgYHt58Kl2kCeMlQb"
+)
 
 img_size = (224, 224)
+HAND_NEAR_MOUTH_THRESHOLD = 1.8
 
 DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
 result = urlparse(DATABASE_URL)
@@ -61,7 +71,7 @@ def preprocess_for_pill_detection(frame):
     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
     return combined_mask
 
-def detect_pill(frame):
+def detect_pill_tflite(frame):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     seg_results = selfie_segmentation.process(rgb_frame)
     person_mask = seg_results.segmentation_mask
@@ -98,6 +108,36 @@ def detect_pill(frame):
                     break
     return pill_detected
 
+
+def detect_pill_roboflow(frame):
+    _, img_encoded = cv2.imencode('.jpg', frame)
+    result = PILL_CLIENT.infer(img_encoded.tobytes(), model_id="pill-detection-llp4r/3")
+    predictions = result.get('predictions', [])
+    return any(pred['confidence'] > 0.62 for pred in predictions)
+
+def calculate_distance(point1, point2):
+    return np.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2 + (point1.z - point2.z)**2)
+
+def check_hand_near_mouth(pose_landmarks, hand_landmarks):
+    if pose_landmarks and hand_landmarks:
+        mouth_left = pose_landmarks.landmark[mp_pose.PoseLandmark.MOUTH_LEFT]
+        mouth_right = pose_landmarks.landmark[mp_pose.PoseLandmark.MOUTH_RIGHT]
+
+        for hand_landmark in hand_landmarks:
+            index_tip = hand_landmark.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            thumb_tip = hand_landmark.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            index_distance_left = calculate_distance(index_tip, mouth_left)
+            index_distance_right = calculate_distance(index_tip, mouth_right)
+            thumb_distance_left = calculate_distance(thumb_tip, mouth_left)
+            thumb_distance_right = calculate_distance(thumb_tip, mouth_right)
+
+            if (0.65 < index_distance_left < HAND_NEAR_MOUTH_THRESHOLD or
+                0.65 < index_distance_right < HAND_NEAR_MOUTH_THRESHOLD or
+                0.65 < thumb_distance_left < HAND_NEAR_MOUTH_THRESHOLD or
+                0.65 < thumb_distance_right < HAND_NEAR_MOUTH_THRESHOLD):
+                return True
+    return False
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.json
@@ -124,13 +164,34 @@ def login():
     else:
         return jsonify({"success": False, "message": "Please provide both name and IC."})
 
-@app.route('/detect_pill', methods=['POST'])
-def process_image():
+
+@app.route('/detect_medicine_intake', methods=['POST'])
+def detect_medicine_intake():
     file = request.files['image']
     npimg = np.fromfile(file, np.uint8)
     frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-    pill_detected = detect_pill(frame)
-    return jsonify({"pill_detected": pill_detected})
+    
+    # Detect pill using both methods
+    pill_detected_tflite = detect_pill_tflite(frame)
+    pill_detected_roboflow = detect_pill_roboflow(frame)
+    pill_detected = pill_detected_tflite and pill_detected_roboflow
+    
+    # Check for hand near mouth
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pose_results = pose.process(rgb_frame)
+    hand_results = hands.process(rgb_frame)
+    hand_near_mouth = check_hand_near_mouth(pose_results.pose_landmarks, hand_results.multi_hand_landmarks)
+    
+    # For bottle detection, we'd need to implement or integrate YOLO here
+    # For now, we'll assume bottle detection is always true
+    bottle_detected = True
+    
+    return jsonify({
+        "pill_detected": pill_detected,
+        "hand_near_mouth": hand_near_mouth,
+        "bottle_detected": bottle_detected
+    })
+
 
 @app.route('/update_intake', methods=['POST'])
 def update_intake():
