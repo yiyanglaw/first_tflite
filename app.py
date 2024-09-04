@@ -70,50 +70,6 @@ def detect_pills(frame):
                 boxes.append({'x': x, 'y': y, 'width': w, 'height': h, 'confidence': confidence, 'class': class_name})
     return boxes
 
-def detect_bottles(frame):
-    # Load YOLO
-    net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
-    classes = []
-    with open("coco.names", "r") as f:
-        classes = [line.strip() for line in f.readlines()]
-    layer_names = net.getLayerNames()
-    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-
-    height, width, _ = frame.shape
-    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
-    net.setInput(blob)
-    layer_outputs = net.forward(output_layers)
-
-    boxes = []
-    confidences = []
-    class_ids = []
-
-    for output in layer_outputs:
-        for detection in output:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
-            if confidence > 0.4 and classes[class_id] == 'bottle':
-                center_x, center_y, w, h = (detection[0:4] * np.array([width, height, width, height])).astype('int')
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
-                boxes.append([x, y, int(w), int(h)])
-                confidences.append(float(confidence))
-                class_ids.append(class_id)
-
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-
-    detected_bottles = []
-    if len(indices) > 0:
-        indices = indices.flatten()
-        for i in indices:
-            detected_bottles.append({
-                'box': boxes[i],
-                'confidence': confidences[i],
-                'class': classes[class_ids[i]]
-            })
-    return detected_bottles
-
 def calculate_distance(point1, point2):
     return np.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2 + (point1.z - point2.z)**2)
 
@@ -163,8 +119,8 @@ def login():
     else:
         return jsonify({"success": False, "message": "Please provide both name and IC."})
 
-@app.route('/detect_pill', methods=['POST'])
-def process_image():
+@app.route('/detect_pill_and_hand', methods=['POST'])
+def detect_pill_and_hand():
     file = request.files['image']
     npimg = np.fromfile(file, np.uint8)
     frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
@@ -184,14 +140,9 @@ def process_image():
     # Check for hand near mouth
     hand_near_mouth = check_hand_near_mouth(pose_results.pose_landmarks, hand_results.multi_hand_landmarks)
 
-    # Detect bottles
-    bottle_boxes = detect_bottles(frame)
-    bottle_detected = len(bottle_boxes) > 0
-
     return jsonify({
         "pill_detected": pill_detected,
-        "hand_near_mouth": hand_near_mouth,
-        "bottle_detected": bottle_detected
+        "hand_near_mouth": hand_near_mouth
     })
 
 @app.route('/update_intake', methods=['POST'])
