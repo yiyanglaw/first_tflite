@@ -4,31 +4,30 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
 from flask import Flask, request, jsonify
 import cv2
 import numpy as np
-from tflite_runtime.interpreter import Interpreter
 import mediapipe as mp
-from scipy.ndimage import label as ndi_label
 import psycopg2
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import logging
+from inference_sdk import InferenceHTTPClient
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-interpreter = Interpreter(model_path='mobilenet_pill_detection.tflite')
-interpreter.allocate_tensors()
+# Initialize the inference client for pill detection
+PILL_CLIENT = InferenceHTTPClient(
+    api_url="https://detect.roboflow.com",
+    api_key="lJ0tgYHt58Kl2kCeMlQb"
+)
 
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-
+# Initialize mediapipe pose and hand detectors
+mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.8)
+mp_drawing = mp.solutions.drawing_utils
 
-mp_selfie_segmentation = mp.solutions.selfie_segmentation
-selfie_segmentation = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
-
-img_size = (224, 224)
+# Define the threshold for hand near mouth detection
+HAND_NEAR_MOUTH_THRESHOLD = 1.8
 
 DATABASE_URL = "postgresql://cms_data_user:zD3zjXh6FRSd4GbInv0gALpHoCejfdCG@dpg-cr0aic3v2p9s73a4gpc0-a.singapore-postgres.render.com/cms_data"
 result = urlparse(DATABASE_URL)
@@ -47,56 +46,96 @@ def get_db_connection():
         port=port
     )
 
-def preprocess_for_pill_detection(frame):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower_white = np.array([0, 0, 200])
-    upper_white = np.array([180, 30, 255])
-    lower_light = np.array([0, 0, 150])
-    upper_light = np.array([180, 60, 255])
-    mask_white = cv2.inRange(hsv, lower_white, upper_white)
-    mask_light = cv2.inRange(hsv, lower_light, upper_light)
-    combined_mask = cv2.bitwise_or(mask_white, mask_light)
-    kernel = np.ones((5,5), np.uint8)
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-    return combined_mask
+def detect_pills(frame):
+    import tempfile
+    import os
 
-def detect_pill(frame):
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    seg_results = selfie_segmentation.process(rgb_frame)
-    person_mask = seg_results.segmentation_mask
-    hand_results = hands.process(rgb_frame)
-    hand_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    if hand_results.multi_hand_landmarks:
-        for hand_landmarks in hand_results.multi_hand_landmarks:
-            for landmark in hand_landmarks.landmark:
-                x, y = int(landmark.x * frame.shape[1]), int(landmark.y * frame.shape[0])
-                cv2.circle(hand_mask, (x, y), 20, 255, -1)
-    combined_mask = cv2.bitwise_and(person_mask, person_mask, mask=hand_mask)
-    combined_mask = (combined_mask * 255).astype(np.uint8)
-    roi = cv2.bitwise_and(frame, frame, mask=combined_mask)
-    pill_mask = preprocess_for_pill_detection(roi)
-    labeled_mask, num_labels = ndi_label(pill_mask)
-    pill_detected = False
-    for label_id in range(1, num_labels + 1):
-        label_mask = (labeled_mask == label_id).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(label_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            if 1 < area < 10000:
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                roi = frame[y:y+h, x:x+w]
-                img = cv2.resize(roi, img_size)
-                img = img / 255.0
-                img = np.expand_dims(img, axis=0).astype(np.float32)
-                interpreter.set_tensor(input_details[0]['index'], img)
-                interpreter.invoke()
-                prediction = interpreter.get_tensor(output_details[0]['index'])
-                if prediction[0] > 0.6:
-                    pill_detected = True
-                    break
-    return pill_detected
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+        temp_filename = temp_file.name
+        cv2.imwrite(temp_filename, frame)
+        result = PILL_CLIENT.infer(temp_filename, model_id="pill-detection-llp4r/3")
+    os.remove(temp_filename)
+
+    boxes = []
+    if 'predictions' in result:
+        predictions = result['predictions']
+        for pred in predictions:
+            if pred['confidence'] > 0.62:
+                x = int(pred['x'] - pred['width'] / 2)
+                y = int(pred['y'] - pred['height'] / 2)
+                w = int(pred['width'])
+                h = int(pred['height'])
+                confidence = pred['confidence']
+                class_name = pred['class']
+                boxes.append({'x': x, 'y': y, 'width': w, 'height': h, 'confidence': confidence, 'class': class_name})
+    return boxes
+
+def detect_bottles(frame):
+    # Load YOLO
+    net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
+    classes = []
+    with open("coco.names", "r") as f:
+        classes = [line.strip() for line in f.readlines()]
+    layer_names = net.getLayerNames()
+    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+    height, width, _ = frame.shape
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+    net.setInput(blob)
+    layer_outputs = net.forward(output_layers)
+
+    boxes = []
+    confidences = []
+    class_ids = []
+
+    for output in layer_outputs:
+        for detection in output:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > 0.4 and classes[class_id] == 'bottle':
+                center_x, center_y, w, h = (detection[0:4] * np.array([width, height, width, height])).astype('int')
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+                boxes.append([x, y, int(w), int(h)])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+
+    detected_bottles = []
+    if len(indices) > 0:
+        indices = indices.flatten()
+        for i in indices:
+            detected_bottles.append({
+                'box': boxes[i],
+                'confidence': confidences[i],
+                'class': classes[class_ids[i]]
+            })
+    return detected_bottles
+
+def calculate_distance(point1, point2):
+    return np.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2 + (point1.z - point2.z)**2)
+
+def check_hand_near_mouth(pose_landmarks, hand_landmarks):
+    if pose_landmarks and hand_landmarks:
+        mouth_left = pose_landmarks.landmark[mp_pose.PoseLandmark.MOUTH_LEFT]
+        mouth_right = pose_landmarks.landmark[mp_pose.PoseLandmark.MOUTH_RIGHT]
+
+        for hand_landmark in hand_landmarks:
+            index_tip = hand_landmark.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            thumb_tip = hand_landmark.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            index_distance_left = calculate_distance(index_tip, mouth_left)
+            index_distance_right = calculate_distance(index_tip, mouth_right)
+            thumb_distance_left = calculate_distance(thumb_tip, mouth_left)
+            thumb_distance_right = calculate_distance(thumb_tip, mouth_right)
+
+            if (0.65 < index_distance_left < HAND_NEAR_MOUTH_THRESHOLD or
+                0.65 < index_distance_right < HAND_NEAR_MOUTH_THRESHOLD or
+                0.65 < thumb_distance_left < HAND_NEAR_MOUTH_THRESHOLD or
+                0.65 < thumb_distance_right < HAND_NEAR_MOUTH_THRESHOLD):
+                return True
+    return False
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -129,8 +168,31 @@ def process_image():
     file = request.files['image']
     npimg = np.fromfile(file, np.uint8)
     frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-    pill_detected = detect_pill(frame)
-    return jsonify({"pill_detected": pill_detected})
+    
+    # Detect pills
+    pill_boxes = detect_pills(frame)
+    pill_detected = len(pill_boxes) > 0
+
+    # Detect pose and hands
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose, \
+         mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+        
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pose_results = pose.process(image)
+        hand_results = hands.process(image)
+
+    # Check for hand near mouth
+    hand_near_mouth = check_hand_near_mouth(pose_results.pose_landmarks, hand_results.multi_hand_landmarks)
+
+    # Detect bottles
+    bottle_boxes = detect_bottles(frame)
+    bottle_detected = len(bottle_boxes) > 0
+
+    return jsonify({
+        "pill_detected": pill_detected,
+        "hand_near_mouth": hand_near_mouth,
+        "bottle_detected": bottle_detected
+    })
 
 @app.route('/update_intake', methods=['POST'])
 def update_intake():
@@ -169,6 +231,7 @@ def update_intake():
     finally:
         cur.close()
         conn.close()
+
 @app.route('/get_pending_times/<int:patient_id>', methods=['GET'])
 def get_pending_times(patient_id):
     conn = get_db_connection()
